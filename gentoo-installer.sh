@@ -99,29 +99,36 @@ if [ "$BOOT_MODE" = "uefi" ] && [ ! -d /sys/firmware/efi ]; then
 fi
 
 # ==================================================================
-# 3. Particionamento manual
+# 3. Particionamento manual (opcional)
 # ==================================================================
-step "Ferramenta de particionamento"
-echo "1) cfdisk (interface ncurses simples)"
-echo "2) fdisk (linha de comando, MBR/GPT)"
-echo "3) parted (linha de comando, GPT recomendado)"
-while true; do
-    opt=$(ask "Escolha a ferramenta (1/2/3)")
-    case "$opt" in
-        1) PART_TABLE_TOOL="cfdisk"; break ;;
-        2) PART_TABLE_TOOL="fdisk"; break ;;
-        3) PART_TABLE_TOOL="parted"; break ;;
-        *) warn "Opção inválida." ;;
-    esac
-done
+step "Particionamento"
+SKIP_PARTITIONING=0
+if confirm "As partições em $DISK já existem? (pular etapa de particionamento e ir direto para format/mountpoints)"; then
+    SKIP_PARTITIONING=1
+    log "Particionamento pulado. Usando as partições já existentes em $DISK."
+    lsblk "$DISK"
+else
+    echo "1) cfdisk (interface ncurses simples)"
+    echo "2) fdisk (linha de comando, MBR/GPT)"
+    echo "3) parted (linha de comando, GPT recomendado)"
+    while true; do
+        opt=$(ask "Escolha a ferramenta (1/2/3)")
+        case "$opt" in
+            1) PART_TABLE_TOOL="cfdisk"; break ;;
+            2) PART_TABLE_TOOL="fdisk"; break ;;
+            3) PART_TABLE_TOOL="parted"; break ;;
+            *) warn "Opção inválida." ;;
+        esac
+    done
 
-command -v "$PART_TABLE_TOOL" >/dev/null 2>&1 || die "$PART_TABLE_TOOL não está disponível neste live media."
+    command -v "$PART_TABLE_TOOL" >/dev/null 2>&1 || die "$PART_TABLE_TOOL não está disponível neste live media."
 
-log "Abrindo $PART_TABLE_TOOL em $DISK. Crie suas partições e salve antes de sair."
-sleep 1
-"$PART_TABLE_TOOL" "$DISK"
+    log "Abrindo $PART_TABLE_TOOL em $DISK. Crie suas partições e salve antes de sair."
+    sleep 1
+    "$PART_TABLE_TOOL" "$DISK"
 
-lsblk "$DISK"
+    lsblk "$DISK"
+fi
 
 # ==================================================================
 # 4. Definição de filesystem e mountpoint por partição
@@ -215,28 +222,85 @@ done
 # ==================================================================
 # 7. Stage3
 # ==================================================================
+# Links diretos (snapshot fixo). Gerados a partir de:
+#   amd64/arm64: 20260705T*, x86: 20260707T170109Z
+# Caso o mirror expire esses builds, atualize as URLs abaixo em
+# https://www.gentoo.org/downloads/
 step "Download do stage3"
-echo "1) openrc"
-echo "2) systemd"
-while true; do
-    opt=$(ask "Init system para o stage3 (1/2)")
-    case "$opt" in
-        1) INIT_SYSTEM="openrc"; break ;;
-        2) INIT_SYSTEM="systemd"; break ;;
-        *) warn "Opção inválida." ;;
-    esac
-done
 
-ARCH=$(ask "Arquitetura (amd64/x86/arm64)" "amd64")
-MIRROR="https://distfiles.gentoo.org/releases/${ARCH}/autobuilds"
+ARCH=$(ask "Arquitetura (amd64/arm64/x86)" "amd64")
 
-log "Buscando o stage3 mais recente para $ARCH/$INIT_SYSTEM..."
-LATEST_TXT=$(curl -fsSL "${MIRROR}/latest-stage3-${ARCH}-${INIT_SYSTEM}.txt" 2>/dev/null) \
-    || die "Não foi possível obter a lista de stage3. Verifique sua conexão."
+case "$ARCH" in
+    amd64|arm64)
+        echo "1) openrc"
+        echo "2) systemd"
+        while true; do
+            opt=$(ask "Init system para o stage3 (1/2)")
+            case "$opt" in
+                1) INIT_SYSTEM="openrc"; break ;;
+                2) INIT_SYSTEM="systemd"; break ;;
+                *) warn "Opção inválida." ;;
+            esac
+        done
 
-STAGE3_PATH=$(echo "$LATEST_TXT" | grep -v '^#' | awk '{print $1}' | head -n1)
-[ -n "$STAGE3_PATH" ] || die "Não foi possível determinar o arquivo stage3."
-STAGE3_URL="${MIRROR}/${STAGE3_PATH}"
+        echo "1) minimal"
+        echo "2) desktop"
+        while true; do
+            opt=$(ask "Variante do stage3 (1/2)")
+            case "$opt" in
+                1) VARIANT="minimal"; break ;;
+                2) VARIANT="desktop"; break ;;
+                *) warn "Opção inválida." ;;
+            esac
+        done
+        ;;
+    x86)
+        echo "1) openrc"
+        echo "2) systemd"
+        while true; do
+            opt=$(ask "Init system para o stage3 (1/2)")
+            case "$opt" in
+                1) INIT_SYSTEM="openrc"; break ;;
+                2) INIT_SYSTEM="systemd"; break ;;
+                *) warn "Opção inválida." ;;
+            esac
+        done
+
+        echo "1) i686"
+        echo "2) i486"
+        while true; do
+            opt=$(ask "Subarquitetura (1/2)")
+            case "$opt" in
+                1) VARIANT="i686"; break ;;
+                2) VARIANT="i486"; break ;;
+                *) warn "Opção inválida." ;;
+            esac
+        done
+        ;;
+    *)
+        die "Arquitetura inválida: $ARCH"
+        ;;
+esac
+
+# Tabela de links diretos (snapshot fixo, ver comentário acima)
+declare -A STAGE3_LINKS=(
+    [amd64:openrc:minimal]="https://distfiles.gentoo.org/releases/amd64/autobuilds/20260705T170105Z/stage3-amd64-openrc-20260705T170105Z.tar.xz"
+    [amd64:systemd:minimal]="https://distfiles.gentoo.org/releases/amd64/autobuilds/20260705T170105Z/stage3-amd64-systemd-20260705T170105Z.tar.xz"
+    [amd64:openrc:desktop]="https://distfiles.gentoo.org/releases/amd64/autobuilds/20260705T170105Z/stage3-amd64-desktop-openrc-20260705T170105Z.tar.xz"
+    [amd64:systemd:desktop]="https://distfiles.gentoo.org/releases/amd64/autobuilds/20260705T170105Z/stage3-amd64-desktop-systemd-20260705T170105Z.tar.xz"
+    [arm64:openrc:minimal]="https://distfiles.gentoo.org/releases/arm64/autobuilds/20260705T233102Z/stage3-arm64-openrc-20260705T233102Z.tar.xz"
+    [arm64:systemd:minimal]="https://distfiles.gentoo.org/releases/arm64/autobuilds/20260705T233102Z/stage3-arm64-systemd-20260705T233102Z.tar.xz"
+    [arm64:openrc:desktop]="https://distfiles.gentoo.org/releases/arm64/autobuilds/20260705T233102Z/stage3-arm64-desktop-openrc-20260705T233102Z.tar.xz"
+    [arm64:systemd:desktop]="https://distfiles.gentoo.org/releases/arm64/autobuilds/20260705T233102Z/stage3-arm64-desktop-systemd-20260705T233102Z.tar.xz"
+    [x86:openrc:i686]="https://distfiles.gentoo.org/releases/x86/autobuilds/20260707T170109Z/stage3-i686-openrc-20260707T170109Z.tar.xz"
+    [x86:systemd:i686]="https://distfiles.gentoo.org/releases/x86/autobuilds/20260707T170109Z/stage3-i686-systemd-20260707T170109Z.tar.xz"
+    [x86:openrc:i486]="https://distfiles.gentoo.org/releases/x86/autobuilds/20260707T170109Z/stage3-i486-openrc-20260707T170109Z.tar.xz"
+    [x86:systemd:i486]="https://distfiles.gentoo.org/releases/x86/autobuilds/20260707T170109Z/stage3-i486-systemd-20260707T170109Z.tar.xz"
+)
+
+KEY="${ARCH}:${INIT_SYSTEM}:${VARIANT}"
+STAGE3_URL="${STAGE3_LINKS[$KEY]:-}"
+[ -n "$STAGE3_URL" ] || die "Nenhum link encontrado para $KEY."
 
 log "Baixando: $STAGE3_URL"
 cd "$ROOT_MNT" || die "Não foi possível acessar $ROOT_MNT"
