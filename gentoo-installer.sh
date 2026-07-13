@@ -45,8 +45,8 @@ ask() {
 confirm() {
     # confirm "pergunta" -> retorna 0 (sim) ou 1 (não)
     local reply
-    read -rp "$(echo -e "${C_BOLD}$1${C_RESET} [s/N]: ")" reply
-    [[ "$reply" =~ ^[sSyY]$ ]]
+    read -rp "$(echo -e "${C_BOLD}$1${C_RESET} [y/N]: ")" reply
+    [[ "$reply" =~ ^[yY]$ ]]
 }
 
 opt() {
@@ -132,10 +132,8 @@ MSGS[pt:tool_choice_prompt]="Escolha a ferramenta (1/2/3)"
 MSGS[en:tool_choice_prompt]="Choose the tool (1/2/3)"
 MSGS[pt:step_fsmount]="Definição de filesystem e mountpoint"
 MSGS[en:step_fsmount]="Filesystem and mountpoint definition"
-MSGS[pt:dev_prompt]="Dispositivo da partição (ex: %s1) ou 'fim' para terminar"
+MSGS[pt:dev_prompt]="Dispositivo da partição (ex: %s1) ou 'end' para terminar"
 MSGS[en:dev_prompt]="Partition device (e.g: %s1) or 'end' to finish"
-MSGS[pt:fim_keyword]="fim"
-MSGS[en:fim_keyword]="end"
 MSGS[pt:fstype_prompt]="Filesystem para %s (ext4/btrfs/xfs/vfat/swap)"
 MSGS[en:fstype_prompt]="Filesystem for %s (ext4/btrfs/xfs/vfat/swap)"
 MSGS[pt:mount_prompt]="Mountpoint para %s (ex: /, /boot, /home)"
@@ -230,6 +228,12 @@ lsblk -d -o NAME,SIZE,MODEL,TYPE | grep -E 'disk$'
 DISK=$(ask "$(t disk_prompt)")
 [ -b "$DISK" ] || die "Dispositivo $DISK não encontrado."
 
+DISK_TYPE=$(lsblk -no TYPE "$DISK" 2>/dev/null | head -n1)
+if [ "$DISK_TYPE" != "disk" ]; then
+    warn "$DISK parece ser uma partição (tipo: ${DISK_TYPE:-desconhecido}), não um disco inteiro. Isso provavelmente é um erro de digitação."
+    confirm "Continuar mesmo assim?" || die "Instalação abortada."
+fi
+
 warn "$(tf disk_wipe_warn "$DISK")"
 confirm "$(tf confirm_continue_disk "$DISK")" || die "Instalação abortada pelo usuário."
 
@@ -317,13 +321,13 @@ lsblk "$DISK"
 # 4. Definição de filesystem e mountpoint por partição
 # ==================================================================
 step "$(t step_fsmount)"
-echo "Informe cada partição criada. Digite 'fim' no campo do dispositivo para encerrar."
+echo "Informe cada partição criada. Digite 'end' no campo do dispositivo para encerrar."
 echo "Filesystems suportados: ext4, btrfs, xfs, vfat, swap"
 echo
 
 while true; do
     dev=$(ask "$(tf dev_prompt "$DISK")")
-    [ "$dev" = "fim" ] && break
+    [ "$dev" = "end" ] && break
     [ -b "$dev" ] || { warn "Dispositivo $dev não existe."; continue; }
 
     fstype=$(ask "$(tf fstype_prompt "$dev")")
@@ -344,6 +348,19 @@ while true; do
 done
 
 [ "${#PARTS[@]}" -gt 0 ] || die "Nenhuma partição definida. Abortando."
+
+# Detecta dispositivo ou mountpoint repetido (erro comum de digitação)
+seen_devs=" "
+seen_mnts=" "
+for p in "${PARTS[@]}"; do
+    IFS=':' read -r dev mnt _ <<< "$p"
+    case "$seen_devs" in *" $dev "*) die "Dispositivo $dev foi informado mais de uma vez." ;; esac
+    if [ "$mnt" != "swap" ]; then
+        case "$seen_mnts" in *" $mnt "*) die "Mountpoint $mnt foi informado mais de uma vez." ;; esac
+        seen_mnts="$seen_mnts$mnt "
+    fi
+    seen_devs="$seen_devs$dev "
+done
 
 # Precisa existir uma partição raiz
 has_root=0
@@ -384,12 +401,21 @@ step "$(t step_format)"
 for p in "${PARTS[@]}"; do
     IFS=':' read -r dev mnt fstype <<< "$p"
     case "$fstype" in
-        ext4)  log "mkfs.ext4 $dev";  mkfs.ext4 -F "$dev" ;;
-        btrfs) log "mkfs.btrfs $dev"; mkfs.btrfs -f "$dev" ;;
-        xfs)   log "mkfs.xfs $dev";   mkfs.xfs -f "$dev" ;;
+        ext4)
+            log "mkfs.ext4 $dev"
+            mkfs.ext4 -F "$dev" || die "Falha ao formatar $dev como ext4."
+            ;;
+        btrfs)
+            log "mkfs.btrfs $dev"
+            mkfs.btrfs -f "$dev" || die "Falha ao formatar $dev como btrfs."
+            ;;
+        xfs)
+            log "mkfs.xfs $dev"
+            mkfs.xfs -f "$dev" || die "Falha ao formatar $dev como xfs."
+            ;;
         vfat)
             log "mkfs.vfat $dev"
-            mkfs.vfat -F32 "$dev"
+            mkfs.vfat -F32 "$dev" || die "Falha ao formatar $dev como vfat."
             if [ "$BOOT_MODE" = "uefi" ] && [ "$mnt" = "/boot" ]; then
                 partnum=$(echo "$dev" | grep -o '[0-9]*$')
                 if [ -n "$partnum" ]; then
@@ -399,7 +425,14 @@ for p in "${PARTS[@]}"; do
                 fi
             fi
             ;;
-        swap)  log "mkswap $dev";     mkswap "$dev"; swapon "$dev" ;;
+        swap)
+            log "mkswap $dev"
+            mkswap "$dev" || die "Falha ao preparar swap em $dev."
+            swapon "$dev" || die "Falha ao ativar swap em $dev."
+            ;;
+        *)
+            die "Filesystem desconhecido '$fstype' para $dev."
+            ;;
     esac
 done
 
@@ -662,11 +695,11 @@ step "Copiando resolv.conf"
 cp --dereference /etc/resolv.conf "$ROOT_MNT/etc/" || warn "Não foi possível copiar resolv.conf."
 
 step "Montando filesystems virtuais"
-mount --types proc /proc "$ROOT_MNT/proc"
-mount --rbind /sys "$ROOT_MNT/sys"
-mount --make-rslave "$ROOT_MNT/sys"
-mount --rbind /dev "$ROOT_MNT/dev"
-mount --make-rslave "$ROOT_MNT/dev"
+mount --types proc /proc "$ROOT_MNT/proc" || die "Falha ao montar /proc."
+mount --rbind /sys "$ROOT_MNT/sys" || die "Falha ao montar /sys."
+mount --make-rslave "$ROOT_MNT/sys" || die "Falha em 'mount --make-rslave' em /sys."
+mount --rbind /dev "$ROOT_MNT/dev" || die "Falha ao montar /dev."
+mount --make-rslave "$ROOT_MNT/dev" || die "Falha em 'mount --make-rslave' em /dev."
 mount --bind /run "$ROOT_MNT/run" 2>/dev/null || true
 mount --make-slave "$ROOT_MNT/run" 2>/dev/null || true
 
@@ -736,6 +769,17 @@ die()  { echo -e "\033[1;31m[x]\033[0m \$*" >&2; exit 1; }
 log "Sincronizando o Portage (isso pode demorar)..."
 emerge-webrsync
 
+log "Verificando news items do Portage..."
+NEWS_COUNT=\$(eselect news count new 2>/dev/null || echo 0)
+if [ "\${NEWS_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+    log "\$NEWS_COUNT news item(ns) novo(s):"
+    eselect news list 2>/dev/null || true
+    log "Marcando os news items como lidos (eselect news read all)..."
+    eselect news read all >/dev/null 2>&1 || warn "Não consegui marcar os news items como lidos; rode 'eselect news read' manualmente depois."
+else
+    log "Nenhum news item novo."
+fi
+
 log "Selecionando perfil..."
 eselect profile list
 echo "Ajuste o perfil manualmente com 'eselect profile set <n>' se necessário."
@@ -763,12 +807,12 @@ else
 fi
 
 log "Instalando firmware..."
-emerge --ask=n sys-kernel/linux-firmware
+emerge --ask=n --autounmask-write --autounmask-continue sys-kernel/linux-firmware
 
 CPU_VENDOR=\$(grep -m1 'vendor_id' /proc/cpuinfo | awk '{print \$NF}')
 if [ "\$CPU_VENDOR" = "GenuineIntel" ]; then
     log "CPU Intel detectada, instalando sys-firmware/intel-microcode..."
-    emerge --ask=n sys-firmware/intel-microcode
+    emerge --ask=n --autounmask-write --autounmask-continue sys-firmware/intel-microcode
 elif [ "\$CPU_VENDOR" = "AuthenticAMD" ]; then
     log "CPU AMD detectada: o microcode já vem embutido via sys-kernel/linux-firmware."
 else
@@ -778,13 +822,18 @@ fi
 log "Instalando kernel (modo: ${KERNEL_MODE})..."
 case "${KERNEL_MODE}" in
     bin)
-        emerge --ask=n sys-kernel/gentoo-kernel-bin
+        # gentoo-kernel-bin[initramfs] exige sys-kernel/installkernel com a
+        # USE dracut habilitada; sem isso o emerge trava pedindo autounmask.
+        mkdir -p /etc/portage/package.use
+        echo "sys-kernel/installkernel dracut" > /etc/portage/package.use/installkernel
+        emerge --ask=n --autounmask-write --autounmask-continue sys-kernel/gentoo-kernel-bin \
+            || die "Falha ao instalar sys-kernel/gentoo-kernel-bin. Rode 'emerge sys-kernel/gentoo-kernel-bin' manualmente para ver o erro completo."
         # o eclass dist-kernel já instala vmlinuz-*, os módulos e o
         # initramfs (via dracut) em /boot automaticamente no merge.
         ;;
 
     genkernel)
-        emerge --ask=n sys-kernel/gentoo-sources sys-kernel/genkernel
+        emerge --ask=n --autounmask-write --autounmask-continue sys-kernel/gentoo-sources sys-kernel/genkernel
         log "Selecionando fonte do kernel instalada..."
         eselect kernel list
         eselect kernel set 1
@@ -794,7 +843,7 @@ case "${KERNEL_MODE}" in
         ;;
 
     manual)
-        emerge --ask=n sys-kernel/gentoo-sources sys-kernel/genkernel
+        emerge --ask=n --autounmask-write --autounmask-continue sys-kernel/gentoo-sources sys-kernel/genkernel
         log "Selecionando fonte do kernel instalada..."
         eselect kernel list
         eselect kernel set 1
@@ -859,10 +908,10 @@ done
 cat >> "$ROOT_MNT/root/chroot-setup.sh" <<CHROOT_EOF
 
 log "Instalando bootloader ($BOOTLOADER_PKG)..."
-emerge --ask=n sys-boot/grub
+emerge --ask=n --autounmask-write --autounmask-continue sys-boot/grub
 
 if [ "${BOOT_MODE}" = "uefi" ]; then
-    emerge --ask=n sys-boot/efibootmgr
+    emerge --ask=n --autounmask-write --autounmask-continue sys-boot/efibootmgr
 
     if [ -d /sys/firmware/efi ] && ! mountpoint -q /sys/firmware/efi/efivars; then
         log "Montando efivarfs..."
@@ -906,13 +955,13 @@ if [ -n "${NEW_USER}" ]; then
     useradd -m -G users,wheel,audio,video -s /bin/bash "${NEW_USER}"
     echo "Defina a senha para ${NEW_USER}:"
     passwd "${NEW_USER}"
-    emerge --ask=n app-admin/sudo
+    emerge --ask=n --autounmask-write --autounmask-continue app-admin/sudo
     echo "%wheel ALL=(ALL:ALL) ALL" >> /etc/sudoers
 fi
 
 if [ "${INIT_SYSTEM}" = "openrc" ]; then
     log "Configurando serviços OpenRC básicos..."
-    emerge --ask=n net-misc/dhcpcd app-admin/sysklogd sys-process/cronie
+    emerge --ask=n --autounmask-write --autounmask-continue net-misc/dhcpcd app-admin/sysklogd sys-process/cronie
     rc-update add dhcpcd default
     rc-update add sysklogd default
     rc-update add cronie default
@@ -920,7 +969,7 @@ if [ "${INIT_SYSTEM}" = "openrc" ]; then
 
     if [ "${VARIANT}" = "desktop" ]; then
         log "Variante desktop: instalando e habilitando dbus..."
-        emerge --ask=n sys-apps/dbus
+        emerge --ask=n --autounmask-write --autounmask-continue sys-apps/dbus
         rc-update add dbus default
     fi
 else
@@ -952,7 +1001,7 @@ if [ "$X11_CHOSEN" -eq 1 ]; then
     cat >> "$ROOT_MNT/root/chroot-setup.sh" <<CHROOT_EOF
 
 log "Instalando driver libinput (mouse, teclado e touchpad) para o X11..."
-emerge --ask=n x11-drivers/xf86-input-libinput
+emerge --ask=n --autounmask-write --autounmask-continue x11-drivers/xf86-input-libinput
 mkdir -p /etc/X11/xorg.conf.d
 cat > /etc/X11/xorg.conf.d/30-touchpad.conf <<'TOUCHPAD_EOF'
 Section "InputClass"
@@ -984,7 +1033,7 @@ if [ "$CONFIGURE_WIFI" -eq 1 ]; then
         cat >> "$ROOT_MNT/root/chroot-setup.sh" <<CHROOT_EOF
 
 log "Configurando WiFi ($WIFI_SSID em $WIFI_IFACE)..."
-emerge --ask=n net-wireless/wpa_supplicant
+emerge --ask=n --autounmask-write --autounmask-continue net-wireless/wpa_supplicant
 mkdir -p /etc/wpa_supplicant
 CHROOT_EOF
         if [ -n "$WIFI_PASS" ]; then
@@ -1013,7 +1062,7 @@ CHROOT_EOF
         cat >> "$ROOT_MNT/root/chroot-setup.sh" <<CHROOT_EOF
 
 log "Configurando WiFi ($WIFI_SSID em $WIFI_IFACE)..."
-emerge --ask=n net-wireless/wpa_supplicant
+emerge --ask=n --autounmask-write --autounmask-continue net-wireless/wpa_supplicant
 mkdir -p /etc/wpa_supplicant
 CHROOT_EOF
         if [ -n "$WIFI_PASS" ]; then
