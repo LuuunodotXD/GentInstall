@@ -1211,8 +1211,9 @@ CHROOT_EOF
 if [ "$PRIV_TOOL" = "doas" ]; then
     cat >> "$ROOT_MNT/root/chroot-setup.sh" <<CHROOT_EOF
     log "Instalando doas (com persist)..."
-    mkdir -p /etc/portage/package.use
+    mkdir -p /etc/portage/package.use /etc/portage/package.accept_keywords
     echo "app-admin/doas persist" > /etc/portage/package.use/doas
+    echo "app-admin/doas ~${ARCH}" > /etc/portage/package.accept_keywords/doas
     emerge --ask=n --autounmask-write --autounmask-continue app-admin/doas
     echo "permit persist :wheel" > /etc/doas.conf
     chown root:root /etc/doas.conf
